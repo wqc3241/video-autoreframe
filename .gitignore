@@ -1,0 +1,10 @@
+# Python virtualenv — rebuilt per machine (see Setup in SKILL.md); ~1.1 GB
+venv/
+
+__pycache__/
+*.py[cod]
+
+# YOLO weights land here on first run
+*.pt
+
+.DS_Store
