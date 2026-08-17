@@ -99,10 +99,12 @@ def main():
                     help="Optional sendcmd file from 2b_solve_pip.py. When "
                     "given, a picture-in-picture tracking the opponent is "
                     "overlaid on the output.")
-    ap.add_argument("--pip-display-w", type=int, default=380,
+    ap.add_argument("--pip-display-w", type=int, default=475,
                     help="PiP display width in output pixels (at the default "
-                    "1080x1920 output; height follows the PiP aspect). The "
-                    "source crop is small, so keep the upscale under ~1.8x")
+                    "1080x1920 output; height follows the PiP aspect). 475 "
+                    "(~44%% of a 1080-wide output) is the user-approved "
+                    "size; the ~2x lanczos upscale from the small source "
+                    "crop is acceptable on phone screens")
     ap.add_argument("--pip-x", type=int, default=28,
                     help="PiP left edge in output px")
     ap.add_argument("--pip-y", type=int, default=120,

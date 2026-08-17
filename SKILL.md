@@ -142,9 +142,10 @@ Key facts learned building this:
   --y2-min/--y2-max` per venue if the picker reports low pick rates.
 - PiP source-crop height defaults to 2.5× the opponent's median bbox height
   (16:9) with a 5% upward bias, so the framing scales with distance; display
-  width 380px at 1080x1920, positioned at (28, 120) — below the platform-UI
-  zone at the top of vertical players. Override with
-  `--pip-display-w/--pip-x/--pip-y`. Keep the crop TIGHT: in this camera
+  width 475px (~44% of a 1080-wide output, user-approved size — the ~2x
+  lanczos upscale from the small source crop reads fine on phones),
+  positioned at (28, 120) — below the platform-UI zone at the top of
+  vertical players. Override with `--pip-display-w/--pip-x/--pip-y`. Keep the crop TIGHT: in this camera
   geometry the near player's head/racket reaches into the far-court y-band
   whenever the two players x-align (e.g. mid-court ball pickup), and a loose
   crop fills with the near player's back. Tight crop + up-bias limits the

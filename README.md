@@ -4,13 +4,20 @@ A [Claude Code](https://claude.com/claude-code) skill that turns a landscape vid
 into a vertical (9:16 by default) clip which smoothly tracks one specific person —
 holding steady when they leave frame, and refusing to latch onto bystanders.
 
-Three stages, all in `scripts/`:
+Three stages, all in `scripts/`, plus an optional opponent picture-in-picture:
 
 | Stage | Script | What it does |
 |---|---|---|
 | 1 | `1_detect.py` | YOLOv8 + ByteTrack → per-frame people (x, y2, bbox, track id) |
 | 2 | `2_solve_path.py` | tid-locked subject picker + static-fixture filter → OSQP-optimized camera trajectory with hard in-frame constraints |
-| 3 | `3_encode.py` | ffmpeg `sendcmd` crop + lanczos upscale + H.264 |
+| 2b | `2b_solve_pip.py` | *(optional)* far-court opponent picker + 2-axis QP path for a live "opponent cam" picture-in-picture |
+| 3 | `3_encode.py` | ffmpeg `sendcmd` crop + lanczos upscale + H.264; `--pip-cmds` overlays the opponent PiP top-left |
+
+The PiP needs its own detection pass (`--min-h 35 --imgsz 1280` — a far-court
+opponent is ~50px tall in 1080p, invisible to the default filters); the
+opponent picker survives ByteTrack fragmenting a 50px person into a dozen
+track ids per minute. See the PiP section of [`SKILL.md`](SKILL.md) for the
+three phantom-adoption traps it defends against.
 
 ## Install
 
