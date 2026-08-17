@@ -85,18 +85,35 @@ def main():
                     "walking into the far-court band to collect balls)")
     ap.add_argument("--max-h", type=float, default=None,
                     help="Absolute height cap in px; overrides --max-h-ratio")
-    ap.add_argument("--static-min-lifetime-s", type=float, default=6.0,
+    ap.add_argument("--static-min-lifetime-s", type=float, default=1.5,
                     help="Blacklist a tid as a static bystander when it "
                     "lives at least this long AND moves less than "
-                    "--static-max-x-range")
+                    "--static-max-x-range. Keep this LOW (~1.5s): a static "
+                    "phantom (seated spectator/furniture) that survives the "
+                    "blacklist gets ADOPTed during a brief opponent "
+                    "detection gap and then poisons the position anchor for "
+                    "a whole tid-memory window. The real opponent's own "
+                    "still fragments are also blacklisted by this, which is "
+                    "fine — the hold-last-position behavior keeps them in "
+                    "frame precisely because they are standing still.")
     ap.add_argument("--static-max-x-range", type=float, default=40)
+    ap.add_argument("--min-tid-count", type=int, default=5,
+                    help="ADOPT/COLD only consider tids with at least this "
+                    "many in-band samples over the whole video. A one-off "
+                    "flicker detection (e.g. a 2-sample phantom at the band "
+                    "edge) must not be adoptable during a brief opponent "
+                    "dropout; real opponent fragments persist >=0.5s.")
     ap.add_argument("--max-jump-px", type=float, default=150)
-    ap.add_argument("--tid-memory-s", type=float, default=6.0,
+    ap.add_argument("--tid-memory-s", type=float, default=4.0,
                     help="After losing the lock, adopt a NEW tid appearing "
-                    "within this window if it is near the last position")
-    ap.add_argument("--adopt-radius-px", type=float, default=150,
+                    "within this window if it is near the last position; "
+                    "past the window, cold-start re-picks by presence")
+    ap.add_argument("--adopt-radius-px", type=float, default=250,
                     help="Max x-distance from last position for adopting a "
-                    "new tid during the memory window")
+                    "new tid during the memory window. Must cover the "
+                    "position jump across a rally-cut boundary (SwingVision "
+                    "sources are auto-edited rally clips: the opponent can "
+                    "teleport ~200px across a cut)")
     ap.add_argument("--pip-src-h", type=int, default=None,
                     help="PiP source-crop height in px. Default: "
                     "2.5 * median opponent bbox height, clamped [110, H/3]. "
@@ -191,7 +208,9 @@ def main():
                  if in_band(p)
                  and p["tid"] not in static_tids
                  and p["tid"] not in tall_tids
-                 and p["h"] <= per_sample_h_cap]
+                 and p["h"] <= per_sample_h_cap
+                 and (tid_band_count[p["tid"]] >= args.min_tid_count
+                      or p["tid"] == prev_tid)]
         if not cands:
             reasons["no_cands"] += 1
             continue

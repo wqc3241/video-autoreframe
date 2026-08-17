@@ -152,6 +152,23 @@ Key facts learned building this:
 - During rally gaps the PiP holds its last position (same
   invisible-fit-weight mechanism as the main path) — better than hiding or
   chasing noise.
+- **Three phantom-adoption traps, found by validating opponent-in-PiP
+  coverage per sample** (target ≥99%; first pass scored 91%):
+  1. A short-lived static phantom (seated spectator, furniture) survives a
+     6s-lifetime static blacklist, gets ADOPTed during a brief opponent
+     dropout, then anchors the position so the real opponent re-appears
+     outside the adopt radius. Blacklist statics from 1.5s of lifetime; the
+     opponent's own still fragments being blacklisted too is harmless
+     (hold-last-position covers someone who is standing still by
+     definition).
+  2. SwingVision-style sources are auto-edited rally clips: the opponent
+     teleports ~200px across a cut. Adopt radius must be ~250px, not 150.
+  3. With the larger radius, a 1-2 sample flicker detection at the band edge
+     becomes adoptable during a dropout. Require tids to have ≥5 in-band
+     samples (0.5s) before ADOPT/COLD may select them.
+  Always re-run the coverage validation after tuning: parse the emitted
+  cmds, and for each detection sample check the nearest legitimate
+  opponent detection sits inside the solved crop.
 
 ## Critical gotchas (learned the hard way)
 
