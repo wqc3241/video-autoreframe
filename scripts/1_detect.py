@@ -22,6 +22,16 @@ def main():
     ap.add_argument("--model", default="yolov8n.pt",
                     help="YOLO model (yolov8n.pt fastest, yolov8m.pt more accurate)")
     ap.add_argument("--conf", type=float, default=0.3)
+    ap.add_argument("--min-h", type=float, default=80,
+                    help="Drop detections shorter than this many px. Lower to "
+                    "~35 to keep a far-court opponent (who can be only "
+                    "50-60px tall in 1080p and invisible at the default).")
+    ap.add_argument("--imgsz", type=int, default=640,
+                    help="Inference resolution. 1280 markedly improves "
+                    "recall/conf on small far-court subjects.")
+    ap.add_argument("--device", default="",
+                    help="Torch device, e.g. 'mps' on Apple Silicon or 'cpu'. "
+                    "Empty = ultralytics default.")
     args = ap.parse_args()
 
     model = YOLO(args.model)
@@ -42,9 +52,13 @@ def main():
             break
         if idx % args.sample_every == 0:
             t_sec = idx / fps
-            results = model.track(frame, classes=[0], verbose=False,
-                                  conf=args.conf, persist=True,
-                                  tracker="bytetrack.yaml")
+            track_kwargs = dict(classes=[0], verbose=False,
+                                conf=args.conf, persist=True,
+                                imgsz=args.imgsz,
+                                tracker="bytetrack.yaml")
+            if args.device:
+                track_kwargs["device"] = args.device
+            results = model.track(frame, **track_kwargs)
             people = []
             for r in results:
                 if r.boxes is None:
@@ -56,7 +70,7 @@ def main():
                     w = x2 - x1
                     cx = (x1 + x2) / 2
                     cy = (y1 + y2) / 2
-                    if h < 80:
+                    if h < args.min_h:
                         continue
                     tid = int(ids[i].item()) if ids is not None else -1
                     people.append({

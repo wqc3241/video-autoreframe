@@ -19,7 +19,11 @@ Pipeline (all in `scripts/`):
 1. **`1_detect.py`** — YOLOv8 + ByteTrack → per-frame list of people (x, y2, bbox).
 2. **`2_solve_path.py`** — temporal-coherent person picker + static-fixture
    filter + QP-optimized camera trajectory with hard safety constraints.
-3. **`3_encode.py`** — emits sendcmd + ffmpeg crop + lanczos upscale + H.264.
+3. **`2b_solve_pip.py`** *(optional)* — opponent (far-court player) picker +
+   2-axis QP path → sendcmd for a picture-in-picture overlay.
+4. **`3_encode.py`** — emits sendcmd + ffmpeg crop + lanczos upscale + H.264.
+   With `--pip-cmds`, overlays a live opponent-tracking PiP (top-left by
+   default).
 
 ## When to invoke
 
@@ -84,6 +88,70 @@ PY="$SKILL_DIR/venv/bin/python"
   --src "$SRC" --cmds "$WORK/crop_cmds.txt" \
   --out "$OUT" --target-aspect 9:16 --crf 12
 ```
+
+## Opponent picture-in-picture (optional)
+
+Adds a small live "tracking camera" of the opponent (far-court player) in the
+top-left of the vertical output while the main crop follows the near player.
+
+```bash
+# PiP needs its OWN detection pass — see gotcha below. MPS makes this ~60fps.
+"$PY" "$SKILL_DIR/scripts/1_detect.py" "$SRC" "$WORK/opp_detections.json" \
+  --model yolov8m.pt --conf 0.15 --min-h 35 --imgsz 1280 --device mps
+
+# Solve the opponent PiP path (x and y)
+"$PY" "$SKILL_DIR/scripts/2b_solve_pip.py" \
+  --detections "$WORK/opp_detections.json" \
+  --out-cmds "$WORK/pip_cmds.txt"
+
+# Encode with the overlay
+"$PY" "$SKILL_DIR/scripts/3_encode.py" \
+  --src "$SRC" --cmds "$WORK/crop_cmds.txt" \
+  --pip-cmds "$WORK/pip_cmds.txt" \
+  --out "$OUT" --target-aspect 9:16 --crf 12
+```
+
+Key facts learned building this:
+
+- **The default detection pass CANNOT see a far-court opponent.** In 1080p
+  indoor-tennis footage the opponent across the net is only ~50-60px tall —
+  below the default `--min-h 80` — and at imgsz 640 their confidence is
+  marginal. Use `--min-h 35 --imgsz 1280 --conf 0.15` (with yolov8m) for the
+  PiP pass. Keep the main-subject pass at defaults; lowering min-h globally
+  floods the main picker with tiny bystanders.
+- **Do NOT require per-tid motion.** ByteTrack fragments a 50px opponent
+  into 10+ short tids per minute, and individual fragments often don't move
+  (opponent standing between rallies) — a "tid must have moved ≥100px"
+  filter dropped the pick rate to 49% on real footage. Static bystanders are
+  instead blacklisted only when a tid is BOTH long-lived (≥6s) and immobile
+  (x-range <40px); short still fragments of the real opponent survive.
+- **Height-cap the candidates.** When the near player walks deep to collect
+  balls they enter the far-court band; at that camera depth the opponent is
+  ~50px tall but any near person in the band is 120px+. Cap at 1.8x the
+  median in-band height (per-tid median AND per-sample), and the near
+  player is cleanly rejected while the opponent (h up to ~72px when serving)
+  passes.
+- **`sendcmd` targets must be instance-named when the graph has two crops.**
+  An untargeted `crop x N` is delivered to EVERY crop filter in the graph.
+  2b emits `crop@pip x/y`; 3_encode rewrites main lines to `crop@main` and
+  merges the two files (commands sharing a timestamp are grouped into one
+  interval because sendcmd needs strictly increasing interval times).
+- The opponent search band defaults to x ∈ [0.33W, 0.67W], y2 ∈
+  [0.42H, 0.72H] — the far half of the player's own court. Adjacent-court
+  players and fence-line walkers sit outside it; tune `--x-min/--x-max/
+  --y2-min/--y2-max` per venue if the picker reports low pick rates.
+- PiP source-crop height defaults to 2.5× the opponent's median bbox height
+  (16:9) with a 5% upward bias, so the framing scales with distance; display
+  width 380px at 1080x1920, positioned at (28, 120) — below the platform-UI
+  zone at the top of vertical players. Override with
+  `--pip-display-w/--pip-x/--pip-y`. Keep the crop TIGHT: in this camera
+  geometry the near player's head/racket reaches into the far-court y-band
+  whenever the two players x-align (e.g. mid-court ball pickup), and a loose
+  crop fills with the near player's back. Tight crop + up-bias limits the
+  intrusion to a head sliver at the PiP's bottom edge.
+- During rally gaps the PiP holds its last position (same
+  invisible-fit-weight mechanism as the main path) — better than hiding or
+  chasing noise.
 
 ## Critical gotchas (learned the hard way)
 
