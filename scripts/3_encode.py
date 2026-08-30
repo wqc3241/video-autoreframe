@@ -74,8 +74,8 @@ def build_pip_graph(args, crop_w, crop_h, out_w, out_h):
         main_scale = f",scale={out_w}:{out_h}:flags=lanczos"
     return (
         f"sendcmd=f={merged},split=2[m][p];"
-        f"[m]crop@main={crop_w}:{crop_h}:0:0{main_scale}[main];"
-        f"[p]crop@pip={pip_w}:{pip_h}:0:0,"
+        f"[m]crop@main={crop_w}:{crop_h}:0:0:exact=1{main_scale}[main];"
+        f"[p]crop@pip={pip_w}:{pip_h}:0:0:exact=1,"
         f"scale={disp_w}:{disp_h}:flags=lanczos,"
         f"pad={disp_w + 2*b}:{disp_h + 2*b}:{b}:{b}:color=white[pip];"
         f"[main][pip]overlay={args.pip_x}:{args.pip_y}"
@@ -130,7 +130,11 @@ def main():
     if args.pip_cmds:
         vf = build_pip_graph(args, crop_w, crop_h, out_w, out_h)
     else:
-        vf = f"sendcmd=f={args.cmds},crop={crop_w}:{crop_h}:0:0"
+        # exact=1: without it, crop rounds x down to even for 4:2:0 chroma
+        # alignment, so a slow 1px/frame pan becomes a 2px step every other
+        # frame -- visible micro-judder. Exact odd-x luma placement costs
+        # only a half-chroma-sample misregistration, which is invisible.
+        vf = f"sendcmd=f={args.cmds},crop={crop_w}:{crop_h}:0:0:exact=1"
         if not args.no_upscale:
             vf += f",scale={out_w}:{out_h}:flags=lanczos"
 
