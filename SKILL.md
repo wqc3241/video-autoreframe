@@ -78,6 +78,9 @@ PY="$SKILL_DIR/venv/bin/python"
 "$PY" "$SKILL_DIR/scripts/1_detect.py" "$SRC" "$WORK/detections.json"
 
 # Step 2: solve camera path (<1s)
+# Add --cut-snap for rally compilations (SwingVision "Included Rallies" and
+# any fixed-camera auto-edit): the camera then cuts at each splice instead
+# of whip-panning across it. See the cut-snap gotcha below.
 "$PY" "$SKILL_DIR/scripts/2_solve_path.py" \
   --detections "$WORK/detections.json" \
   --target-aspect 9:16 \
@@ -150,6 +153,16 @@ Key facts learned building this:
   whenever the two players x-align (e.g. mid-court ball pickup), and a loose
   crop fills with the near player's back. Tight crop + up-bias limits the
   intrusion to a head sliver at the PiP's bottom edge.
+- **`--tid-memory-s` gates COLD START, so it caps how long a stuck PiP can
+  stay stuck.** With the 4.0s default, an opponent standing ~330px from the
+  held position (outside the 250px adopt radius) is invisible to all three
+  branches until 4s elapse — on the 08-21-2026 footage that produced a
+  single 3.55s window with the PiP on empty court, capping coverage at
+  96.2%. Dropping to 0.6s lets COLD START re-pick the dominant in-band tid
+  (which is the opponent by construction) and lifted coverage to 99.6% /
+  100% on the two clips, with **identical** smoothness (mean 0.59, max 17
+  px/frame at every value tested). Prefer lowering this over widening
+  `--adopt-radius-px`, which reintroduces the phantom-adoption traps below.
 - During rally gaps the PiP holds its last position (same
   invisible-fit-weight mechanism as the main path) — better than hiding or
   chasing noise.
@@ -167,9 +180,22 @@ Key facts learned building this:
   3. With the larger radius, a 1-2 sample flicker detection at the band edge
      becomes adoptable during a dropout. Require tids to have ≥5 in-band
      samples (0.5s) before ADOPT/COLD may select them.
-  Always re-run the coverage validation after tuning: parse the emitted
-  cmds, and for each detection sample check the nearest legitimate
-  opponent detection sits inside the solved crop.
+  Always re-run the coverage validation after tuning, with
+  `scripts/2c_validate_pip.py`. It re-derives the legitimate-opponent
+  candidate set using the same band + static/tall/min-count/height-cap
+  filters as 2b, parses the emitted `crop@pip` timeline, and reports the
+  fraction of samples where a legitimate opponent actually sits inside the
+  solved crop, plus the miss timestamps:
+
+  ```bash
+  "$PY" "$SKILL_DIR/scripts/2c_validate_pip.py" \
+    --detections "$WORK/opp_detections.json" \
+    --cmds "$WORK/pip_cmds.txt"
+  ```
+
+  Keep its filters in sync with 2b — an over-permissive validator reports
+  phantom misses (e.g. omitting the per-sample height cap flags near-player
+  detections that 2b correctly rejected).
 
 ## Critical gotchas (learned the hard way)
 
@@ -239,6 +265,42 @@ as `--invisible-fit-weight 0.15` in `2_solve_path.py`.
 Verify by dumping the crop_x trajectory across an invisible region — it
 should be roughly constant, not U-shaped.
 
+### Rally compilations splice without any scene change (`--cut-snap`)
+
+SwingVision "Included Rallies" exports (and any fixed-camera rally
+compilation) concatenate rally segments. Because the camera never moves and
+the background is identical, **ffmpeg scene detection finds nothing** — even
+at `gt(scene,0.06)` — yet the players teleport across the splice.
+
+Symptom: 8-13 bursts per clip where the camera whip-pans the full frame
+width over 0.15-0.4s. The first ~0.4s of every rally (often the serve) is
+off-frame while the camera catches up.
+
+**Fix:** `--cut-snap` on `2_solve_path.py`. It detects splices from the
+subject trajectory (the largest-bbox near-court candidate is a reliable
+"where is the main player" proxy), resets the picker at each cut so the
+stale lock and jump guard don't fight the new position, and drops the QP
+smoothness rows spanning the cut frame so the camera pays no
+velocity/acceleration penalty for jumping there. The camera cuts instead of
+pans.
+
+Two splice signatures, both needed:
+1. **Adjacent samples teleport** — `|dx| >= --cut-jump-px` (400) within
+   `--cut-max-dt` (0.25s). Nobody covers 400px in 0.1s, so this is certain.
+2. **Subject reappears far away after an absence** — the player was
+   undetected for a gap and returns `>= --cut-jump-px` away, within
+   `--cut-max-gap-s` (3.0s). A player who genuinely ran that far would have
+   been detected the whole way. Catching only signature 1 leaves ~20% of
+   splices as whip-pans, because the subject is frequently off-frame right
+   before a cut.
+
+Measured on 08-21-2026 SwingVision footage (2 clips, 1080p59): p99 camera
+velocity 39.7 -> 17.3 px/frame, `reacquire_jumpy` 35 -> 0, valid picks
+83.4% -> 86.1%. Default is OFF; behaviour is byte-identical without the flag.
+
+Residual sub-0.3s fast pans immediately *before* a cut are real — the camera
+chasing a wide ball as the rally ends. Don't tune those away.
+
 ### Camera tracks the wrong person during between-rally moments
 
 Failure mode: between rallies, the main player briefly walks off-screen or
@@ -260,6 +322,43 @@ Note that bbox **height alone** (h) is NOT a clean separator: the main player
 at the far baseline drops to h=120-140, overlapping with bystanders' h range.
 But the player is always *wider* (w ~ 45-55) than far-edge walkers (w ~ 25-32),
 so `h * w` separates cleanly.
+
+### Near-camera pedestrians beat every size filter — gate by position
+
+On courts with a walkway/promenade right behind a fence (08-30-2026 Hudson
+River Park footage), a jogger walking close past the fence line reaches
+bbox area 12000-16500 and h up to 183 — bigger than the "main player
+crouched at baseline" thresholds, so the area floor AND the cold-start
+min-h both pass. When the player is briefly off-frame (pulled wide outside
+the wide-angle FOV — happens on off-center camera positions), cold start
+latches onto the jogger and the camera swings to the fence.
+
+Size cannot fix this; position can. `--x-min/--x-max` on `2_solve_path.py`
+reject candidates outside the court region entirely (that footage used
+`--x-max 1520`). Look up the fence/court extent in a source frame before
+solving. Defaults are ±inf (off).
+
+### Cut-snap's proxy needs its own area floor
+
+The splice detector follows the largest *near-court* candidate with no size
+floor. While the player was off-frame for ~3s mid-rally, tiny walkway
+detections (area 2500-3700) became the proxy, and their jumps produced 4-6
+phantom splices *inside a continuous rally* — each one a hard camera cut.
+`--cut-proxy-min-area` (default 4500, matching the main-player minimum)
+keeps sub-player-sized detections from ever driving splice detection.
+True splices where the player stands near the same spot on both sides
+need no cut anyway, so losing tiny-proxy coverage costs nothing.
+
+### tid=-1 is not an identity
+
+ByteTrack emits tid=-1 for untracked boxes. The LOCKED branch treated
+"prev pick was -1" + "candidate is -1" as the same person; with the
+dt-scaled jump allowance (150 + 1500*dt) a 1.2s gap authorizes a ~1900px
+teleport — the lock jumped from the real player (x=80) to a pedestrian
+(x=1266) and the camera parked on the fence for 2s. Fixed in
+`2_solve_path.py`: tid<0 picks never enter the lock (prev_tid stays None,
+position/size memory still updates), so untracked detections can only be
+picked through the size-gated re-acquire / cold-start branches.
 
 ## Subject-selection strategy
 

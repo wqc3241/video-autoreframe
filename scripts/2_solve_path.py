@@ -32,6 +32,13 @@ def main():
                     "far (farthest), or any (largest bbox)")
     ap.add_argument("--y2-min", type=float, default=600,
                     help="Min bottom-of-bbox y2 for 'near' subject")
+    ap.add_argument("--x-min", type=float, default=float("-inf"),
+                    help="Reject candidates left of this x (subject-region "
+                    "gate; excludes e.g. walkway pedestrians beyond a fence)")
+    ap.add_argument("--x-max", type=float, default=float("inf"),
+                    help="Reject candidates right of this x. Big near-camera "
+                    "walkers outside the court pass every size filter, so "
+                    "gate them out by position instead")
     ap.add_argument("--safety-margin", type=int, default=90,
                     help="Subject must be >= this many px from crop edges")
     ap.add_argument("--w-vel", type=float, default=5.0)
@@ -59,6 +66,36 @@ def main():
                     "(h*w) >= this. Filters narrow distant bystanders that "
                     "pass the h-ratio check when the locked subject was at "
                     "the far baseline (where prev_h is also small).")
+    ap.add_argument("--cut-snap", action="store_true",
+                    help="Detect hard rally splices -- subject teleports "
+                    "with NO pixel-level scene change, as produced by "
+                    "SwingVision 'Included Rallies' exports from a fixed "
+                    "camera -- and snap the camera instantly at each cut "
+                    "instead of panning across it. Without this the camera "
+                    "spends ~0.4s whip-panning after every splice and the "
+                    "start of each rally is off-frame.")
+    ap.add_argument("--cut-jump-px", type=float, default=400,
+                    help="Min subject x-teleport between two consecutive "
+                    "samples to count as a cut (with --cut-snap).")
+    ap.add_argument("--cut-max-dt", type=float, default=0.25,
+                    help="Two ADJACENT samples this far apart or less whose "
+                    "subject teleports are always a splice -- nobody covers "
+                    "--cut-jump-px in that time.")
+    ap.add_argument("--cut-proxy-min-area", type=float, default=4500,
+                    help="Cut-snap only: min bbox area (h*w) for a detection "
+                    "to drive the subject-position proxy. The main player is "
+                    ">=4500 even crouched at the baseline; without this floor "
+                    "a tiny bystander becomes the proxy whenever the player "
+                    "is briefly undetected, and the resulting position jumps "
+                    "register as phantom splices. 0 disables.")
+    ap.add_argument("--cut-max-gap-s", type=float, default=3.0,
+                    help="A splice is also flagged when the subject goes "
+                    "undetected for a while and then REAPPEARS >= "
+                    "--cut-jump-px away, provided the gap is no longer than "
+                    "this. A player who genuinely ran that far would have "
+                    "been detected the whole way, so an absence plus a "
+                    "distant return is a cut -- and snapping beats whip-"
+                    "panning off the held position either way.")
     ap.add_argument("--cold-start-min-h", type=float, default=170,
                     help="Cold-start (no recent lock) requires a candidate "
                     "with at least this bbox height. Filters distant walkers.")
@@ -112,6 +149,42 @@ def main():
         yb = int(p["y2"] // BIN) * BIN
         return (xb, yb) in fixture_cells
 
+    # ---- Splice (hard cut) detection ----
+    # A fixed-camera rally compilation has no scene change at a cut, so
+    # ffmpeg scene detection finds nothing; the only signal is that the
+    # subject teleports. Use the largest-bbox near-court candidate as a
+    # cheap proxy for "where the main player is" -- near the camera they
+    # dominate bbox area -- and flag implausible jumps between adjacent
+    # samples as cuts.
+    cut_sample_idx = set()
+    if args.cut_snap:
+        proxy = np.full(len(samples), np.nan)
+        for i, s_ in enumerate(samples):
+            c = [p for p in s_["people"]
+                 if p["y2"] >= args.y2_min and not is_fixture(p)
+                 and args.x_min <= p["x"] <= args.x_max
+                 and p["h"] * p["w"] >= args.cut_proxy_min_area]
+            if c:
+                proxy[i] = max(c, key=lambda p: p["h"] * p["w"])["x"]
+        nominal_dt = float(np.median(np.diff(sample_t))) if len(samples) > 1 else 0.0
+        last_i = None
+        for i in range(len(samples)):
+            if np.isnan(proxy[i]):
+                continue
+            if last_i is not None:
+                dt_c = sample_t[i] - sample_t[last_i]
+                jump = abs(proxy[i] - proxy[last_i])
+                # A gap means the subject was undetected in between, so a
+                # distant return is a splice rather than a sprint.
+                gapped = dt_c > 1.5 * nominal_dt
+                if jump >= args.cut_jump_px and (
+                        dt_c <= args.cut_max_dt
+                        or (gapped and dt_c <= args.cut_max_gap_s)):
+                    cut_sample_idx.add(i)
+            last_i = i
+        print(f"Cut-snap: {len(cut_sample_idx)} splices detected at t="
+              f"{[round(float(sample_t[i]), 2) for i in sorted(cut_sample_idx)]}")
+
     # ---- Tid-locked subject picker ----
     # State machine:
     #   LOCKED (have prev_tid): keep picking that tid as it appears
@@ -137,8 +210,18 @@ def main():
         depth_key = lambda p: p["h"] * p["w"]
 
     for i, s in enumerate(samples):
+        if i in cut_sample_idx:
+            # New rally: the old lock refers to a pre-splice position, and
+            # the jump guard would reject the (correct) new one. Force a
+            # clean cold start.
+            prev_tid = None
+            prev_x = None
+            prev_y2 = None
+            prev_h = None
+            prev_t = None
         cands = [p for p in s["people"]
-                 if p["y2"] >= args.y2_min and not is_fixture(p)]
+                 if p["y2"] >= args.y2_min and not is_fixture(p)
+                 and args.x_min <= p["x"] <= args.x_max]
         if not cands:
             reasons["no_cands"] += 1
             continue
@@ -146,8 +229,13 @@ def main():
         picked = None
         dt = (s["t"] - prev_t) if prev_t is not None else 1e9
 
-        # 1) LOCKED: try to pick the same tid as last frame.
-        if prev_tid is not None:
+        # 1) LOCKED: try to pick the same tid as last frame. Untracked
+        #    detections (tid < 0) carry no identity -- two different people
+        #    both reported as tid -1 would "match" across seconds, with the
+        #    dt-scaled jump allowance letting the lock teleport onto a
+        #    bystander. Those may only be picked via the size-gated
+        #    re-acquire / cold-start branches below.
+        if prev_tid is not None and prev_tid >= 0:
             same = [p for p in cands if p["tid"] == prev_tid]
             if same:
                 cand = same[0]
@@ -162,7 +250,7 @@ def main():
         #    The area floor catches narrow far-edge detections where the
         #    h-ratio alone is too lenient (e.g. when prev_h is also small
         #    because the subject was at the far baseline).
-        if (picked is None and prev_tid is not None and prev_h is not None
+        if (picked is None and prev_h is not None
                 and dt <= args.reacquire_window_s):
             min_h = args.reacquire_min_h_ratio * prev_h
             sim = [p for p in cands
@@ -208,7 +296,8 @@ def main():
             continue
 
         sample_x[i] = picked["x"]
-        prev_tid = picked.get("tid", prev_tid)
+        _tid = picked.get("tid", -1)
+        prev_tid = _tid if _tid is not None and _tid >= 0 else None
         prev_x = picked["x"]
         prev_y2 = picked["y2"]
         prev_h = picked["h"]
@@ -230,6 +319,20 @@ def main():
     if first_valid is not None:
         sx[:first_valid] = sample_x[first_valid]
     subject_x = np.interp(frame_t, sample_t, sx)
+
+    # Frames where the camera is allowed to teleport. Also stop the
+    # interpolated subject estimate from ramping across the splice --
+    # hold the pre-cut position right up to the cut frame.
+    cut_frames = set()
+    for i in sorted(cut_sample_idx):
+        f_cut = int(round(sample_t[i] * fps))
+        f_cut = max(1, min(N - 1, f_cut))
+        cut_frames.add(f_cut)
+        if i > 0:
+            f_prev = int(round(sample_t[i - 1] * fps))
+            f_prev = max(0, min(f_prev, f_cut))
+            if f_prev < f_cut:
+                subject_x[f_prev:f_cut] = sx[i - 1]
 
     # Per-frame visibility mask (real detection within 0.15s).
     det_times = sample_t[valid]
@@ -288,17 +391,26 @@ def main():
     fit_mask = np.where(visible, 1.0, float(args.invisible_fit_weight))
 
     # ---- Build QP matrices ----
-    rows = np.arange(N - 1)
+    # Smoothness rows that would span a cut frame are dropped, which fully
+    # decouples the segments either side of a splice: the camera pays no
+    # velocity/acceleration penalty for jumping there, so it snaps rather
+    # than whip-panning. With no cuts this is identical to the plain
+    # first/second-difference operators.
+    r1 = np.array([r for r in range(N - 1) if (r + 1) not in cut_frames],
+                  dtype=int)
+    k1 = np.arange(len(r1))
     D1 = sparse.csr_matrix(
-        (np.r_[-np.ones(N - 1), np.ones(N - 1)],
-         (np.r_[rows, rows], np.r_[rows, rows + 1])),
-        shape=(N - 1, N))
-    rows2 = np.arange(N - 2)
+        (np.r_[-np.ones(len(r1)), np.ones(len(r1))],
+         (np.r_[k1, k1], np.r_[r1, r1 + 1])),
+        shape=(max(len(r1), 1), N))
+    r2 = np.array([r for r in range(N - 2)
+                   if (r + 1) not in cut_frames and (r + 2) not in cut_frames],
+                  dtype=int)
+    k2 = np.arange(len(r2))
     D2 = sparse.csr_matrix(
-        (np.r_[np.ones(N - 2), -2 * np.ones(N - 2), np.ones(N - 2)],
-         (np.r_[rows2, rows2, rows2],
-          np.r_[rows2, rows2 + 1, rows2 + 2])),
-        shape=(N - 2, N))
+        (np.r_[np.ones(len(r2)), -2 * np.ones(len(r2)), np.ones(len(r2))],
+         (np.r_[k2, k2, k2], np.r_[r2, r2 + 1, r2 + 2])),
+        shape=(max(len(r2), 1), N))
     F = sparse.diags(fit_mask, format="csr")
 
     P = 2 * (args.w_vel * (D1.T @ D1)
