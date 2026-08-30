@@ -4,10 +4,17 @@ description: >
   Auto-reframe a landscape video to vertical (9:16) or any aspect ratio,
   keeping a specific person smoothly in view via YOLO detection + ByteTrack
   identity tracking + QP-optimized camera path. Handles off-screen holds,
-  bystander rejection, and near/far-court perspective changes. Use when the
-  user asks to "crop to 9:16", "make vertical video", "auto reframe",
-  "track me in this video", "convert landscape to TikTok/Reels/Shorts", or
-  supplies a horizontal video to reshape for social media.
+  bystander rejection, and near/far-court perspective changes. Also ships
+  the stage-0 prep tools: wide-angle tilt/warp correction for fixed-camera
+  footage (camera re-rotation homography from measured court lines) and
+  automatic long-rally extraction (audio hit transients + double gate +
+  pose cross-validation) for requests like 剪出连续拉球大于N拍的片段.
+  Use when the user asks to "crop to 9:16", "make vertical video", "auto
+  reframe", "track me in this video", "convert landscape to
+  TikTok/Reels/Shorts", asks to straighten/warp-correct a tilted wide-angle
+  clip (视频倾斜/广角变形/warp一下), asks to cut out the long rallies from
+  practice footage, or supplies a horizontal video to reshape for social
+  media.
 ---
 
 # Video Auto-Reframe
@@ -25,6 +32,15 @@ Pipeline (all in `scripts/`):
    With `--pip-cmds`, overlays a live opponent-tracking PiP (top-left by
    default).
 
+Stage-0 source prep (optional, run BEFORE the pipeline when asked):
+- **Warp / tilt correction** for wide-angle fixed-camera footage —
+  `zoom_grid.py` + `measure_tilt.py` + `solve_warp.py` (see "Stage 0A").
+- **Rally extraction** (连续多拍拉球 / "cut the long rallies") —
+  `detect_rallies.py` + `event_montage.py` + optional `validate_hits.py`
+  / `apply_validation.py` + `cut_rallies.py` (see "Stage 0B").
+Both stages were built and verified on 08-30-2026 Hudson River Park
+footage (iPhone ultrawide 1080p59.94, fixed tripod, off-center camera).
+
 ## When to invoke
 
 The user gives you a landscape video and wants it reformatted for vertical
@@ -33,6 +49,8 @@ playback while keeping them (or another subject) centered. Typical requests:
 - "Track me in this video and crop to portrait"
 - "Make a TikTok/Reels version of this"
 - "Follow me in this clip"
+- "剪出连续拉球大于N拍的片段" / "cut the long rallies" → run Stage 0B first
+- "视频有点倾斜/广角变形, warp 一下" → run Stage 0A first
 
 ## Clarifying questions to ask first
 
@@ -91,6 +109,116 @@ PY="$SKILL_DIR/venv/bin/python"
   --src "$SRC" --cmds "$WORK/crop_cmds.txt" \
   --out "$OUT" --target-aspect 9:16 --crf 12
 ```
+
+## Stage 0A: Wide-angle tilt correction (warp)
+
+For fixed-camera wide-angle footage that looks tilted/skewed ("有点倾斜变形").
+Root cause on court footage: the tripod stands OFF the court centerline and
+aims back toward it, so every real-world horizontal line (baseline, net,
+horizon) slopes in the image — the near baseline can hit −3° while the
+horizon does −1°. A single roll can't fix both; an arbitrary 4-point
+homography warps out-of-plane content (players lean). The right model is a
+**pure camera re-rotation** `H = K·R(yaw, roll)·K⁻¹` — physically a virtual
+re-aim, so people and buildings stay natural. On the reference footage
+yaw +7.58° / roll −0.21° took every line from up-to-−3.1° down to ≤1°,
+keeping 88% of the frame.
+
+Workflow (once per fixed camera position):
+1. **Confirm the camera never moves**: extract frames at 4-5 spread
+   timestamps and compare framing. One warp then serves the whole video.
+2. **Measure 3-4 reference lines that are horizontal in the real world**,
+   weighted by visibility in the final crop. Good set for tennis: near
+   baseline (weight 3), net top band (2), a distant rail/horizon (2), a
+   service line (1). Read endpoints from gridded zooms:
+   ```bash
+   "$PY" "$SKILL_DIR/scripts/zoom_grid.py" frame.jpg X0 Y0 W H SCALE out.png
+   ```
+   then eyeball coordinates off the labeled grid (±3 px is plenty).
+   **Manual endpoint reading beats auto-detection**: HoughLinesP
+   (`measure_tilt.py`) drowns in shadow edges and pavement seams — use it
+   only as a rough first look and for before/after verification. Beware
+   mis-identifying lines: on two-tone courts the long line behind the
+   player is usually the BASELINE, not the service line (players stand on
+   the runoff behind it); and vanishing-point reasoning from short
+   segments (net-post feet under occlusion) is garbage — the least-squares
+   over full-length lines is what's robust.
+3. **Solve + preview**:
+   ```bash
+   "$PY" "$SKILL_DIR/scripts/solve_warp.py" --lines lines.json \
+     --out warp.json frame1.jpg frame2.jpg
+   ```
+   `focal_px` 720 fits iPhone ultrawide video at 1920 wide; roll is
+   focal-independent and small focal errors barely move the result.
+   Check residual angles ≤ ~1° and LOOK at the `_warp.jpg` previews
+   (verticals near center upright, no weird stretch).
+4. **Apply the warp inside the cut step** (`cut_rallies.py --warp`), not as
+   a separate encode — the whole prep chain then costs one resample.
+
+## Stage 0B: Rally extraction (连续多拍拉球自动识别)
+
+Turns a fixed-camera practice video into a reel of only the long rallies
+(e.g. "连续拉球>7拍"). Audio transients are the primary signal; pose
+validation and dense-frame checks keep the counts honest.
+
+```bash
+# 1. Detect hits + group into candidate rallies
+"$PY" "$SKILL_DIR/scripts/detect_rallies.py" --src "$SRC" --outdir "$WORK" \
+  --min-hits 8 --min-dur 10        # ">7拍" = events>=8 AND duration>=10s
+
+# 2. (neighbouring-court noise suspected?) pose cross-validation
+"$PY" "$SKILL_DIR/scripts/validate_hits.py" --src "$SRC" \
+  --hits "$WORK/hits.json" --outdir "$WORK" \
+  --far-crop 430 500 1180 700 --far-x-min 500   # tune band per venue
+"$PY" "$SKILL_DIR/scripts/apply_validation.py" \
+  --validated "$WORK/hits_validated.json"
+
+# 3. Adjudicate boundaries with frame montages (see doctrine below)
+"$PY" "$SKILL_DIR/scripts/event_montage.py" "$SRC" m.jpg t1 t2 t3 ...
+
+# 4. Write the curated rallies_final.json by hand, then cut+warp+concat
+"$PY" "$SKILL_DIR/scripts/cut_rallies.py" --src "$SRC" \
+  --rallies rallies_final.json --warp warp.json --outdir "$WORK"
+
+# 5. Feed $WORK/rally_reel.mov to the normal pipeline with --cut-snap
+#    (and --x-max if a walkway runs behind a court fence).
+```
+
+**Why the double gate works.** Far-court hits are ~50% missed (quiet) and
+some events are bounces, so raw event counts lie in both directions. But
+rec groundstroke cadence is ~1.2–1.6 s per shot, so DURATION anchors the
+true count: `events ≥ 8 AND duration ≥ 10 s` is robust to both error
+modes. Don't relax the 2.6 s intra-rally gap to rescue holes (see below).
+
+**Adjudication doctrine** (the part that cannot be automated away):
+- **Holes of 2.9–3.4 s between adjacent groups**: could be two missed far
+  hits (same rally) or a dead ball + instant re-feed. Montage frames
+  across the hole: mid-swing/recovery-footwork = merge; ball-pickup
+  posture (bent over, racket scooping, walking to net) = keep split.
+- **A periodic ~3.4 s train of isolated single events** is the player
+  collecting balls and bouncing them on the racket — never a rally.
+- **Pose validation error modes** (`apply_validation.py` header too):
+  lunge gets and rushed end-of-rally swings score ~1.2–2.4 (false
+  "idle"); racket-scoop pickups score ~3.2 (false "swing"). Therefore:
+  rejections OUTSIDE rally spans are trustworthy; any boundary change
+  they suggest needs a **dense burst (≥2 fps)** — sparse single frames
+  misread windups as walking. On the reference footage the dense check
+  overturned one tail trim (live strokes at the "dead" end) and upheld
+  the other (8 s of dead-ball bounces + racket juggling inflating R4).
+- **Off-frame returns are real**: with an off-center wide camera the
+  player provably keeps rallying from OUTSIDE the FOV. Never delete
+  events just because no player is visible.
+- The audio-event stream cannot resurrect a MISSED hit; if frames prove
+  live play across a >2.6 s hole, merge the groups by hand in the curated
+  config rather than re-tuning the detector.
+
+**Cut pads**: −1.8 s before the first hit (keeps the feed windup),
++2.5 s after the last stroke (shows the point resolving). Each cut should
+contain complete strokes — windup→contact→follow-through.
+
+**Then reframe with `--cut-snap`**: the reel's splices teleport the
+subject; also pass `--x-max <px>` when a public walkway runs behind a
+fence (near-camera pedestrians reach bbox area 16k and defeat every size
+filter — position is the only reliable gate).
 
 ## Opponent picture-in-picture (optional)
 
