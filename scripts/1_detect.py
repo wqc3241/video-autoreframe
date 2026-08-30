@@ -37,6 +37,18 @@ def main():
     model = YOLO(args.model)
     cap = cv2.VideoCapture(args.src)
     fps = cap.get(cv2.CAP_PROP_FPS)
+    # CAP_PROP_FPS on a concat container comes out slightly off (audio
+    # priming lengthens the container duration it divides by). The tiny
+    # error drifts the sendcmd timeline ~1 frame per ~13s, producing bands
+    # of alternating stuck/double-step crop motion. Snap to the standard
+    # rate when within 0.2%.
+    for std in (23.976023976, 24.0, 25.0, 29.97002997, 30.0, 50.0,
+                59.94005994, 60.0, 119.88011988, 120.0):
+        if abs(fps - std) / std < 0.002:
+            if abs(fps - std) > 1e-9:
+                print(f"fps {fps:.5f} -> snapped to {std:.5f}", flush=True)
+            fps = std
+            break
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
