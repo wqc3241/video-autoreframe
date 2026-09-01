@@ -9,12 +9,18 @@ description: >
   footage (camera re-rotation homography from measured court lines) and
   automatic long-rally extraction (audio hit transients + double gate +
   pose cross-validation) for requests like 剪出连续拉球大于N拍的片段.
+  Also ships stage-4 UI transplant: move baked-in SwingVision overlays
+  (落点小地图/球速卡, landing-spot minimap + shot-speed card) into the
+  output straight and at native scale, with presence-gated visibility and
+  a static clone-shift plate hiding the warped original. Output can be
+  vertical 9:16 (tracking crop) or warp-corrected landscape 16:9 — ASK.
   Use when the user asks to "crop to 9:16", "make vertical video", "auto
   reframe", "track me in this video", "convert landscape to
   TikTok/Reels/Shorts", asks to straighten/warp-correct a tilted wide-angle
   clip (视频倾斜/广角变形/warp一下), asks to cut out the long rallies from
-  practice footage, or supplies a horizontal video to reshape for social
-  media.
+  practice footage, asks to keep/move the SwingVision score overlays
+  (把落点卡/球速卡加进去), or supplies a horizontal video to reshape for
+  social media.
 ---
 
 # Video Auto-Reframe
@@ -41,6 +47,12 @@ Stage-0 source prep (optional, run BEFORE the pipeline when asked):
 Both stages were built and verified on 08-30-2026 Hudson River Park
 footage (iPhone ultrawide 1080p59.94, fixed tripod, off-center camera).
 
+Stage-4 finishing (optional, AFTER the pipeline):
+- **Baked-UI transplant** (SwingVision 落点小地图/球速卡) —
+  `4a_detect_ui_presence.py` + `4b_build_static_plate.py` +
+  `4c_transplant_ui.py` (see "Stage 4"). Built and verified on 08-21-2026
+  Harvard indoor SwingVision footage, vertical AND landscape outputs.
+
 ## When to invoke
 
 The user gives you a landscape video and wants it reformatted for vertical
@@ -59,8 +71,17 @@ Before running, confirm:
    closer to camera / farther / left / right side. Offer to extract a preview
    frame if they can't tell.
 2. **Duration** — full video, or trim to a specific time range.
-3. **Aspect ratio** — default 9:16. Confirm if they want 4:5, 1:1, or other.
-4. **Output location** — default: same directory as source with `-9x16` suffix.
+3. **横版还是竖版? (orientation)** — vertical 9:16 tracking crop, or
+   warp-corrected LANDSCAPE 16:9 (full frame, no tracking — just Stage 0A
+   cut+warp, delivered as-is), or both. Always ask when warp is involved;
+   don't assume vertical-only.
+4. **Aspect ratio** (if vertical) — default 9:16. Confirm 4:5, 1:1, other.
+5. **要不要加球速/落点信息卡?** — if the source has baked-in SwingVision
+   overlays (landing-spot minimap, shot-speed card), ask whether to
+   transplant them into the output at native scale (Stage 4). Applies to
+   both orientations. Without transplant, warn that warp shears the baked
+   overlay in whatever corner it lives.
+6. **Output location** — default: same directory as source with `-9x16` suffix.
 
 Also verify source format:
 ```bash
@@ -154,6 +175,11 @@ Workflow (once per fixed camera position):
 4. **Apply the warp inside the cut step** (`cut_rallies.py --warp`), not as
    a separate encode — the whole prep chain then costs one resample.
 
+**Landscape delivery**: when the user wants 横版 (warp-corrected 16:9, no
+tracking crop), the cut+warp reel IS the deliverable — stream-copy it to
+mp4 (`-c copy -tag:v hvc1 -movflags +faststart`, lossless and instant).
+With UI transplant, run the Stage 4 landscape one-pass instead.
+
 ## Stage 0B: Rally extraction (连续多拍拉球自动识别)
 
 Turns a fixed-camera practice video into a reel of only the long rallies
@@ -219,6 +245,63 @@ contain complete strokes — windup→contact→follow-through.
 subject; also pass `--x-max <px>` when a public walkway runs behind a
 fence (near-camera pedestrians reach bbox area 16k and defeat every size
 filter — position is the only reliable gate).
+
+## Stage 4: baked-UI transplant (落点小地图 / 球速卡)
+
+SwingVision burns its overlays into the pixels (top-right: landing-spot
+minimap + shot-speed card). Warp shears them; a tracking crop shows them
+only when the camera pans there. Stage 4 moves them into the output
+straight, at native pixel scale, at a fixed screen position — and hides
+the warped originals.
+
+Two coordinate spaces, never mix them:
+- pasted UI = **screen-space** (fixed in the OUTPUT frame);
+- the plate hiding the old baked overlay = **scene-space** (fixed in the
+  REEL frame, must go in before the crop).
+
+Workflow:
+1. **Measure the boxes once** on an UNWARPED source frame with
+   `zoom_grid.py` (same doctrine as warp lines; read the dark panel edges
+   ±2px). 08-21-2026 reference: minimap 1633,12→1897,347, card
+   1633,368→1897,462.
+2. **Presence scan** — `4a_detect_ui_presence.py --src <unwarped source>
+   --rect card:... --rect minimap:... --t0 <cut start> --t1 <cut end>`.
+   The speed card is NOT persistent (appears after each shot, fades
+   between points); pasting an absent element puts a rectangle of raw
+   background into the composite. Auto-thresholding requires a clean
+   bimodal luma split and picks thresholds inside the empty gap
+   (reference: present 40-47, absent 101-112 — the absent state is dark-ish
+   beam/netting, NOT bright ceiling; guessed thresholds classified 100% as
+   present). Constant-dark elements (the minimap) are reported always_on.
+   Interval edges are pulled in 0.12s so half-faded UI is never pasted.
+3. **Static plate** — `4b_build_static_plate.py --src <reel> --cover
+   <warped bbox of all elements> --donor-x <clean slab>` then LOOK at the
+   preview. Map the source boxes through warp.json's H_total to get the
+   cover bbox. Why a static plate: the camera is fixed and the background
+   static, so ONE frame's pixels cover every frame with zero temporal
+   shimmer. Per-frame fills all failed: ffmpeg delogo's interpolation
+   streaks become a smear slab under the 1.78× vertical upscale;
+   cv2.inpaint (Telea) diffuses dark border content (netting, fixtures)
+   into a wedge. Rules: cover ONE continuous band (split strips leave
+   orphaned real content between them — a floating beam stub); pick a
+   donor slab without one-off features (a duplicated fixture is obvious,
+   duplicated generic ceiling is invisible); feather ~41px.
+4. **Composite**:
+   - vertical: plate → reel (`ffmpeg ... overlay -c:v hevc_videotoolbox
+     -b:v 45M`), re-run `3_encode.py` on the cleaned reel with the SAME
+     crop/pip cmds, then `4c_transplant_ui.py --base <new base> --src
+     <unwarped source> --src-offset <cut start> --element
+     minimap:...@794,120 --element card:...@794,476 --presence ...`.
+     Placement doctrine: below the platform-UI zone (y≥120), opposite
+     side from the PiP; with the reference 264px-wide boxes that is
+     x = 1080−264−22 = 794, card 22px under the minimap.
+   - landscape: one pass — same 4c call with `--base <reel> --plate
+     <plate.png>` and each element pasted back at its ORIGINAL source
+     position (e.g. `@1633,12`).
+
+The transplant sources crops from the UNWARPED source with `-ss <cut
+start>`, so element pixels stay aligned with the reel timeline (verify
+sync once per project: stacked compare or a spot frame).
 
 ## Opponent picture-in-picture (optional)
 
